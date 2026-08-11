@@ -28,19 +28,20 @@ if not PLAYWRIGHT_AVAILABLE:
 
 
 @st.cache_resource(show_spinner="Installing Chromium browser (first run only)…")
-def _ensure_chromium() -> bool:
+def _ensure_chromium() -> tuple[bool, str]:
     """Download the Playwright Chromium binary if it isn't present yet."""
-    # --with-deps installs any remaining OS-level shared libraries
     result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        [sys.executable, "-m", "playwright", "install", "chromium"],
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0
+    return result.returncode == 0, result.stdout + result.stderr
 
 
-if not _ensure_chromium():
-    st.error("Failed to install Chromium. Check the app logs for details.")
+ok, install_log = _ensure_chromium()
+if not ok:
+    st.error("Failed to install Chromium.")
+    st.code(install_log, language="text")
     st.stop()
 
 
