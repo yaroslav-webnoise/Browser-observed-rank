@@ -9,6 +9,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
+
 try:
     import geonamescache
 except Exception:
