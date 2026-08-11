@@ -1,6 +1,8 @@
 import streamlit as st
 from urllib.parse import urlparse, urlencode
 import base64
+import subprocess
+import sys
 import time
 
 try:
@@ -8,7 +10,6 @@ try:
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-
 
 try:
     import geonamescache
@@ -23,6 +24,22 @@ if not PLAYWRIGHT_AVAILABLE:
     st.error(
         "Playwright is not installed. Run: `pip install playwright` then `playwright install chromium`"
     )
+    st.stop()
+
+
+@st.cache_resource(show_spinner="Installing Chromium browser (first run only)…")
+def _ensure_chromium() -> bool:
+    """Download the Playwright Chromium binary if it isn't present yet."""
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+if not _ensure_chromium():
+    st.error("Failed to install Chromium. Check the app logs for details.")
     st.stop()
 
 
