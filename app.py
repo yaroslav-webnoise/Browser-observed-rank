@@ -130,65 +130,80 @@ def scrape_google(query: str, gl: str, hl: str, location: str, google_domain: st
     url = build_google_url(query, gl, hl, location, google_domain)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 900},
             locale=f"{hl}-{gl.upper()}",
+            extra_http_headers={
+                "Accept-Language": f"{hl}-{gl.upper()},{hl};q=0.9,en;q=0.8",
+            },
         )
         page = context.new_page()
-        # Remove the webdriver flag so Google doesn't detect automation.
         page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.goto(url, wait_until="load", timeout=30_000)
         except Exception as e:
             browser.close()
             raise RuntimeError(f"Failed to load Google: {e}") from e
 
-        # Dismiss consent / cookie dialogs (common in EU/IL).
-        for selector in [
-            "button#L2AGLb",       # "I agree"
-            "button#W0wltc",       # "Accept all"
+        # Consent dialogs vary by region; try every known selector.
+        consent_selectors = [
+            "button#L2AGLb",
+            "button#W0wltc",
+            "button[jsname='higCR']",
+            "button[jsname='b3VHJd']",
+            "button[jsname='tWT92d']",
             "form[action*='consent'] button",
-        ]:
+            "div[role='none'] button",
+        ]
+        for sel in consent_selectors:
             try:
-                btn = page.query_selector(selector)
+                btn = page.query_selector(sel)
                 if btn and btn.is_visible():
                     btn.click()
-                    page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                    page.wait_for_load_state("load", timeout=8_000)
                     break
             except Exception:
                 pass
 
-        # Wait for at least one result heading to appear.
+        # Wait for result headings; capture page state for debugging if they never appear.
+        got_results = False
         try:
-            page.wait_for_selector("a[href] h3", timeout=10_000)
+            page.wait_for_selector("h3", timeout=12_000)
+            got_results = True
         except Exception:
             pass
+
+        page_title = page.title()
+        page_url_after = page.url
 
         # Extract organic results via JS — looks for <a><h3> pairs inside #rso.
         raw_results: list[dict] = page.evaluate(
             """() => {
                 const results = [];
                 const seen = new Set();
-                const container = document.querySelector('#rso') || document.body;
-                container.querySelectorAll('a[href] h3').forEach(h3 => {
-                    const a = h3.closest('a[href]');
+                const container = document.querySelector('#rso') || document.querySelector('#search') || document.body;
+                container.querySelectorAll('h3').forEach(h3 => {
+                    const a = h3.closest('a[href]') || h3.querySelector('a[href]');
                     if (!a) return;
                     const href = a.href;
                     if (!href || !href.startsWith('http') || seen.has(href)) return;
-                    // Skip Google-internal navigation links
-                    if (href.includes('google.') && !href.includes('//google.') === false) {
+                    try {
                         const u = new URL(href);
                         if (u.pathname === '/search' || u.pathname.startsWith('/maps')) return;
-                    }
+                        if (u.hostname.includes('google.') && !u.hostname.startsWith('www.')) return;
+                    } catch(e) { return; }
                     seen.add(href);
                     const parent = a.closest('[data-hveid]') || a.closest('.g') || a.parentElement;
                     const snippetEl = parent
@@ -213,7 +228,14 @@ def scrape_google(query: str, gl: str, hl: str, location: str, google_domain: st
         {"position": i + 1, "link": r["link"], "title": r["title"], "snippet": r["snippet"]}
         for i, r in enumerate(raw_results)
     ]
-    return {"organic": organic, "_fetched_at": fetched_at, "_search_url": url}
+    return {
+        "organic": organic,
+        "_fetched_at": fetched_at,
+        "_search_url": url,
+        "_page_title": page_title,
+        "_page_url_after": page_url_after,
+        "_got_h3": got_results,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -371,13 +393,12 @@ if st.button("Check Ranking", type="primary"):
         organic_results = data.get("organic", [])
 
         if not organic_results:
-            st.error(
-                "No organic results were scraped. "
-                "Google may have shown a CAPTCHA or consent dialog. "
-                "Try again in a few seconds."
-            )
+            st.error("No organic results were scraped.")
+            st.caption(f"Page title: {data.get('_page_title', '?')}")
+            st.caption(f"Final URL: {data.get('_page_url_after', '?')}")
+            st.caption(f"Found any h3 elements: {data.get('_got_h3', False)}")
             if search_url:
-                st.caption(f"Search URL used: {search_url}")
+                st.caption(f"Search URL: {search_url}")
             st.stop()
 
         st.caption(f"Scraped {len(organic_results)} organic results — {fetched_at_text}")
