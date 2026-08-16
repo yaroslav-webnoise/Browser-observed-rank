@@ -135,7 +135,7 @@ def is_google_captcha_page(url: str | None) -> bool:
     if not url:
         return False
     lowered = url.lower()
-    return "google.com/sorry" in lowered or "/sorry/index" in lowered or "google.com/recaptcha" in lowered
+    return "google.com/sorry" in lowered or "/sorry/index" in lowered or "google.com/recaptcha" in lowered or "google.com/search?" in lowered and "captcha" in lowered
 
 
 def should_abort_google_search(url: str | None) -> bool:
@@ -145,8 +145,39 @@ def should_abort_google_search(url: str | None) -> bool:
     lowered = url.lower()
     return (
         is_google_captcha_page(lowered)
-        or "google.com/search?" not in lowered and "google.com/search" in lowered and "captcha" in lowered
+        or ("google.com/search" in lowered and "captcha" in lowered)
+        or ("google.com/search?" not in lowered and "google.com/search" in lowered and "sorry" in lowered)
     )
+
+
+def _page_has_real_search_results(page) -> bool:
+    """A non-sorry Google search page is enough evidence that the user has returned to the real search flow."""
+    try:
+        current_url = (page.url or "").lower()
+        if "google.com/search" in current_url and not is_google_captcha_page(current_url):
+            return True
+        if is_google_captcha_page(current_url):
+            return False
+        return bool(page.evaluate("""
+            () => {
+              const text = document.body ? document.body.innerText || '' : '';
+              const hasOrganic = !!document.querySelector('#rso, #search') || document.querySelectorAll('h3').length > 0;
+              const hasSearchSignals = /results for|did you mean|Web results|About/i.test(text);
+              return hasOrganic || hasSearchSignals;
+            }
+        """))
+    except Exception:
+        return False
+
+
+def _wait_for_search_results(page, timeout_seconds: int = 30) -> bool:
+    """Wait for a real Google Search page after the CAPTCHA challenge resolves."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _page_has_real_search_results(page):
+            return True
+        time.sleep(1)
+    return False
 
 
 def _wait_for_captcha_resolution(page, timeout_seconds: int = 600) -> bool:
@@ -411,10 +442,25 @@ def scrape_google(
                     "Google CAPTCHA remained active for too long. This usually means the IP or browser profile is blocked by Google. "
                     "Please retry with a residential proxy or from a normal home IP."
                 )
+            st.info("CAPTCHA cleared. Reloading the exact keyword search so the result page can finish rendering.")
+            for retry in range(2):
+                try:
+                    page.goto(first_url, wait_until="domcontentloaded", timeout=30_000)
+                    _dismiss_consent(page)
+                    if _wait_for_search_results(page, timeout_seconds=20):
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
             page_url_after = page.url
             page_title = page.title()
 
         if should_abort_google_search(page_url_after):
+            context.close()
+            raise RuntimeError(
+                "Google blocked the search request with an anti-bot challenge. "
+                "The app will not keep retrying endlessly. Use a residential proxy or run locally."
+            )
             context.close()
             raise RuntimeError(
                 "Google blocked the search request with an anti-bot challenge. "
@@ -601,6 +647,14 @@ def main() -> None:
             index=DEFAULT_MAX_PAGES - 1,
             help="How many Google result pages to inspect before stopping. Default is 5.",
         )
+
+        st.markdown("---")
+        st.caption("Google anti-bot note")
+        st.info(
+            "If Google keeps showing CAPTCHA pages, the issue is usually the IP/browser being blocked, not the scraper itself. "
+            "A residential proxy or a normal home IP is the most reliable fix."
+        )
+        st.code("PROXY_URL = \"http://user:pass@proxy-host:port\"", language="toml")
 
     keyword = st.text_input("Enter Keyword", placeholder="e.g., digital agency")
     target_domain = st.text_input("Enter Target Domain", placeholder="e.g., limedigital.co.il")
