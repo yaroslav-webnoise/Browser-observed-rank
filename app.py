@@ -328,8 +328,17 @@ def _launch_persistent_context_with_fallback(p, profile_dir: str, **kwargs):
             raise
 
 
-def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
-    """Prefer a fresh temporary browser profile to avoid Google anti-bot flags from reused browser state."""
+def _create_browser_context(
+    p,
+    *,
+    use_proxy: bool,
+    gl: str,
+    hl: str,
+    use_current_chrome_profile: bool = False,
+    chrome_user_data_dir: str | None = None,
+    chrome_profile_name: str = "Default",
+):
+    """Use either the real current Chrome profile or a fresh temp browser profile to reduce Google anti-bot triggers."""
     if use_proxy:
         browser = p.chromium.launch(
             headless=True,
@@ -337,6 +346,30 @@ def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
         return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
+
+    if use_current_chrome_profile:
+        user_data_dir = (chrome_user_data_dir or "").strip()
+        profile_name = (chrome_profile_name or "Default").strip() or "Default"
+        if not user_data_dir:
+            user_data_dir = r"C:\Users\{USERNAME}\AppData\Local\Google\Chrome\User Data"
+            user_data_dir = user_data_dir.replace("{USERNAME}", os.environ.get("USERNAME", ""))
+        if os.path.exists(user_data_dir):
+            try:
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir,
+                    headless=False,
+                    channel="chrome",
+                    args=[
+                        f"--profile-directory={profile_name}",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                    **_CONTEXT_KWARGS(hl, gl),
+                )
+                return context, None
+            except Exception:
+                pass
 
     try:
         browser = p.chromium.launch(
@@ -403,6 +436,9 @@ def scrape_google(
     max_pages: int = DEFAULT_MAX_PAGES,
     target_domain: str | None = None,
     match_mode: str | None = None,
+    use_current_chrome_profile: bool = False,
+    chrome_user_data_dir: str | None = None,
+    chrome_profile_name: str = "Default",
 ) -> dict:
     proxy = _get_proxy()
     first_url = build_google_page_url(query, gl, hl, location, google_domain, start=0)
@@ -416,7 +452,15 @@ def scrape_google(
             )
             context = browser.new_context(**_CONTEXT_KWARGS(hl, gl))
         else:
-            context, browser = _create_browser_context(p, use_proxy=False, gl=gl, hl=hl)
+            context, browser = _create_browser_context(
+                p,
+                use_proxy=False,
+                gl=gl,
+                hl=hl,
+                use_current_chrome_profile=use_current_chrome_profile,
+                chrome_user_data_dir=chrome_user_data_dir,
+                chrome_profile_name=chrome_profile_name,
+            )
 
         page = context.new_page()
 
@@ -649,6 +693,22 @@ def main() -> None:
         )
 
         st.markdown("---")
+        use_current_chrome_profile = st.checkbox(
+            "Use current Chrome profile",
+            value=False,
+            help="Use your real Chrome profile instead of a disposable temp profile. Recommended for local testing with a normal home IP.",
+        )
+        chrome_user_data_dir = st.text_input(
+            "Chrome User Data path",
+            value=r"C:\Users\YOUR_USER\AppData\Local\Google\Chrome\User Data",
+            help="Exact Windows path to your Chrome User Data folder. Example: C:\\Users\\YourName\\AppData\\Local\\Google\\Chrome\\User Data",
+        )
+        chrome_profile_name = st.text_input(
+            "Chrome profile name",
+            value="Default",
+            help="Profile folder name inside User Data, usually Default or Profile 1.",
+        )
+
         st.caption("Google anti-bot note")
         st.info(
             "If Google keeps showing CAPTCHA pages, the issue is usually the IP/browser being blocked, not the scraper itself. "
@@ -682,6 +742,9 @@ def main() -> None:
                         max_pages=page_count,
                         target_domain=target_domain,
                         match_mode=match_mode,
+                        use_current_chrome_profile=use_current_chrome_profile,
+                        chrome_user_data_dir=chrome_user_data_dir,
+                        chrome_profile_name=chrome_profile_name,
                     )
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
