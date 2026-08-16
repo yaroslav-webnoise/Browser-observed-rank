@@ -135,7 +135,18 @@ def is_google_captcha_page(url: str | None) -> bool:
     if not url:
         return False
     lowered = url.lower()
-    return "google.com/sorry" in lowered or "/sorry/index" in lowered
+    return "google.com/sorry" in lowered or "/sorry/index" in lowered or "google.com/recaptcha" in lowered
+
+
+def should_abort_google_search(url: str | None) -> bool:
+    """Stop the scraper when Google is intentionally blocking requests with a challenge page."""
+    if not url:
+        return False
+    lowered = url.lower()
+    return (
+        is_google_captcha_page(lowered)
+        or "google.com/search?" not in lowered and "google.com/search" in lowered and "captcha" in lowered
+    )
 
 
 def _wait_for_captcha_resolution(page, timeout_seconds: int = 600) -> bool:
@@ -392,13 +403,24 @@ def scrape_google(
 
         if is_google_captcha_page(page_url_after):
             st.warning(
-                "Google is showing a CAPTCHA. Please solve it in the Chrome window, then the app will continue automatically."
+                "Google is showing a CAPTCHA. This is a Google anti-bot page, not a scraper bug. "
+                "Please solve the challenge in the browser or use a residential proxy."
             )
-            if not _wait_for_captcha_resolution(page, timeout_seconds=600):
+            if not _wait_for_captcha_resolution(page, timeout_seconds=90):
                 context.close()
-                raise RuntimeError("Google CAPTCHA was not solved in time. Please retry after completing the verification.")
+                raise RuntimeError(
+                    "Google CAPTCHA remained active for too long. This usually means the IP or browser profile is blocked by Google. "
+                    "Please retry with a residential proxy or from a normal home IP."
+                )
             page_url_after = page.url
             page_title = page.title()
+
+        if should_abort_google_search(page_url_after):
+            context.close()
+            raise RuntimeError(
+                "Google blocked the search request with an anti-bot challenge. "
+                "The app will not keep retrying endlessly. Use a residential proxy or run locally."
+            )
 
         all_raw: list[dict] = []
         for page_num in range(max_pages):

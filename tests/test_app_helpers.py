@@ -4,6 +4,7 @@ from app import (
     normalize_domain,
     build_google_page_url,
     is_google_captcha_page,
+    should_abort_google_search,
     _page_contains_target_match,
 )
 
@@ -33,6 +34,12 @@ def test_google_page_url_uses_pagination_when_start_set():
 def test_google_captcha_detection_matches_sorry_page():
     assert is_google_captcha_page("https://www.google.com/sorry/index?continue=https://www.google.com/search") is True
     assert is_google_captcha_page("https://www.google.com/search?q=example") is False
+
+
+def test_google_challenge_abort_detects_blocking_pages():
+    blocked_url = "https://www.google.com/sorry/index?continue=https://www.google.com/search"
+    assert should_abort_google_search(blocked_url) is True
+    assert should_abort_google_search("https://www.google.com/search?q=example") is False
 
 
 def test_page_contains_target_match_stops_on_result_page():
