@@ -263,13 +263,12 @@ def _get_proxy() -> dict | None:
 
 
 def browser_profile_dir() -> str:
-    """Return the stable user profile directory for Chrome, falling back to a fresh temp profile if needed."""
-    home_dir = os.path.abspath(os.path.expanduser("~"))
-    return os.path.abspath(os.path.join(home_dir, ".browser_rank_profile"))
+    """Use a disposable temp Chrome profile to avoid Google tracking stale browser state and triggering anti-bot pages."""
+    return os.path.abspath(os.path.join(tempfile.gettempdir(), f"browser_rank_profile_{os.getpid()}_fresh"))
 
 
 def browser_profile_dir_fallback() -> str:
-    return os.path.abspath(os.path.join(tempfile.gettempdir(), f"browser_rank_profile_{os.getpid()}"))
+    return os.path.abspath(os.path.join(tempfile.gettempdir(), f"browser_rank_profile_{os.getpid()}_fallback"))
 
 
 def _launch_persistent_context_with_fallback(p, profile_dir: str, **kwargs):
@@ -299,7 +298,7 @@ def _launch_persistent_context_with_fallback(p, profile_dir: str, **kwargs):
 
 
 def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
-    """Create a browser context with a persistent profile when possible, else a fresh context."""
+    """Prefer a fresh temporary browser profile to avoid Google anti-bot flags from reused browser state."""
     if use_proxy:
         browser = p.chromium.launch(
             headless=True,
@@ -309,6 +308,13 @@ def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
         return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
 
     try:
+        browser = p.chromium.launch(
+            headless=False,
+            channel="chrome",
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
+    except Exception:
         context = _launch_persistent_context_with_fallback(
             p,
             _PROFILE_DIR,
@@ -317,13 +323,6 @@ def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
             **_CONTEXT_KWARGS(hl, gl),
         )
         return context, None
-    except Exception:
-        browser = p.chromium.launch(
-            headless=False,
-            channel="chrome",
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
 
 
 # Persist cookies/profile between searches so a solved CAPTCHA stays valid.

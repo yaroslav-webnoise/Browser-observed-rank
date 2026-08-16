@@ -1,3 +1,5 @@
+import tempfile
+
 from app import (
     DEFAULT_MAX_PAGES,
     should_continue_scraping,
@@ -5,6 +7,7 @@ from app import (
     build_google_page_url,
     is_google_captcha_page,
     should_abort_google_search,
+    browser_profile_dir,
     _page_contains_target_match,
 )
 
@@ -40,6 +43,12 @@ def test_google_challenge_abort_detects_blocking_pages():
     blocked_url = "https://www.google.com/sorry/index?continue=https://www.google.com/search"
     assert should_abort_google_search(blocked_url) is True
     assert should_abort_google_search("https://www.google.com/search?q=example") is False
+
+
+def test_browser_profile_dir_is_temp_and_disposable():
+    profile_dir = browser_profile_dir()
+    assert profile_dir.startswith(tempfile.gettempdir())
+    assert ".browser_rank_profile" not in profile_dir
 
 
 def test_page_contains_target_match_stops_on_result_page():
