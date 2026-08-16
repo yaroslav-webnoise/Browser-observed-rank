@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 
+DEFAULT_MAX_PAGES = 5
+
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -16,16 +18,6 @@ try:
 except Exception:
     geonamescache = None
 
-st.set_page_config(page_title="SEO Rank Checker", page_icon="📈")
-st.title("🔍 Google Rank Tracker")
-st.write("Find the exact organic position of any website on Google — scraped directly from Google.")
-
-if not PLAYWRIGHT_AVAILABLE:
-    st.error(
-        "Playwright is not installed. Run: `pip install playwright` then `playwright install chromium`"
-    )
-    st.stop()
-
 
 @st.cache_resource(show_spinner="Installing Chromium browser (first run only)…")
 def _ensure_chromium() -> tuple[bool, str]:
@@ -36,13 +28,6 @@ def _ensure_chromium() -> tuple[bool, str]:
         text=True,
     )
     return result.returncode == 0, result.stdout + result.stderr
-
-
-ok, install_log = _ensure_chromium()
-if not ok:
-    st.error("Failed to install Chromium.")
-    st.code(install_log, language="text")
-    st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +126,22 @@ def build_google_page_url(
         if uule:
             params["uule"] = uule
     return f"https://www.{google_domain}/search?{urlencode(params)}"
+
+
+def should_continue_scraping(
+    page_results: list[dict] | None,
+    page_num: int,
+    max_pages: int,
+    min_results_per_page: int = 7,
+) -> bool:
+    """Stop paging early when Google gives a short final page or we have exhausted the requested window."""
+    if page_num >= max_pages:
+        return False
+    if not page_results:
+        return False
+    if len(page_results) < min_results_per_page:
+        return False
+    return page_num + 1 < max_pages
 
 
 _EXTRACT_JS = """() => {
@@ -246,7 +247,7 @@ def _extract_page_results(page) -> list[dict]:
 
 
 def scrape_google(
-    query: str, gl: str, hl: str, location: str, google_domain: str, max_pages: int = 10
+    query: str, gl: str, hl: str, location: str, google_domain: str, max_pages: int = DEFAULT_MAX_PAGES
 ) -> dict:
     proxy = _get_proxy()
     first_url = build_google_page_url(query, gl, hl, location, google_domain, start=0)
@@ -305,8 +306,7 @@ def scrape_google(
             if not page_raw:
                 break
             all_raw.extend(page_raw)
-            # Stop early if Google returned a short page (end of results).
-            if len(page_raw) < 7:
+            if not should_continue_scraping(page_raw, page_num, max_pages):
                 break
 
         fetched_at = int(time.time())
@@ -394,240 +394,264 @@ def is_homepage_url(raw_url: str) -> bool:
     return "/" not in normalized
 
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.header("⚙️ Target Market")
-    country = st.selectbox("Google Country (gl)", ["il", "us", "uk", "ca", "au", "de", "fr"], index=0)
-    language = st.selectbox("Google Language (hl)", ["he", "en", "ar", "fr", "de", "es"], index=0)
 
-    default_google_domain_by_gl = {
-        "il": "google.co.il", "us": "google.com", "uk": "google.co.uk",
-        "ca": "google.ca", "au": "google.com.au", "de": "google.de", "fr": "google.fr",
-    }
-    google_domain_options = [
-        "google.com", "google.co.il", "google.co.uk",
-        "google.ca", "google.com.au", "google.de", "google.fr",
-    ]
-    google_domain = st.selectbox(
-        "Google Domain",
-        google_domain_options,
-        index=google_domain_options.index(default_google_domain_by_gl.get(country, "google.com")),
-        help="Match the Google host used in your browser.",
+def main() -> None:
+    st.set_page_config(page_title="SEO Rank Checker", page_icon="📈")
+    st.title("🔍 Google Rank Tracker")
+    st.write("Find the exact organic position of any website on Google — scraped directly from Google.")
+
+    if not PLAYWRIGHT_AVAILABLE:
+        st.error(
+            "Playwright is not installed. Run: `pip install playwright` then `playwright install chromium`"
+        )
+        st.stop()
+
+    ok, install_log = _ensure_chromium()
+    if not ok:
+        st.error("Failed to install Chromium.")
+        st.code(install_log, language="text")
+        st.stop()
+
+    with st.sidebar:
+        st.header("⚙️ Target Market")
+        country = st.selectbox("Google Country (gl)", ["il", "us", "uk", "ca", "au", "de", "fr"], index=0)
+        language = st.selectbox("Google Language (hl)", ["he", "en", "ar", "fr", "de", "es"], index=0)
+
+        default_google_domain_by_gl = {
+            "il": "google.co.il", "us": "google.com", "uk": "google.co.uk",
+            "ca": "google.ca", "au": "google.com.au", "de": "google.de", "fr": "google.fr",
+        }
+        google_domain_options = [
+            "google.com", "google.co.il", "google.co.uk",
+            "google.ca", "google.com.au", "google.de", "google.fr",
+        ]
+        google_domain = st.selectbox(
+            "Google Domain",
+            google_domain_options,
+            index=google_domain_options.index(default_google_domain_by_gl.get(country, "google.com")),
+            help="Match the Google host used in your browser.",
+        )
+
+        location_options = get_city_options(country)
+        if geonamescache is None:
+            st.caption("Install geonamescache to enable full city list.")
+        selected_location = st.selectbox(
+            "Location (city)",
+            location_options,
+            index=0,
+            help="Choose a city to match browser results more closely.",
+        )
+        location = "" if selected_location == "No location" else selected_location
+
+        strict_homepage_mode = st.checkbox(
+            "Strict homepage mode",
+            value=False,
+            help="When enabled, only counts a match if the homepage/root URL (/) ranks. Inner pages are ignored.",
+        )
+
+        st.subheader("📍 Local Pack Exclusion")
+        use_manual_local_exclusion = st.checkbox("Set map/business count manually", value=False)
+        manual_local_count = st.number_input(
+            "Non-sponsored map/business results above organic",
+            min_value=0, max_value=20, value=0, step=1,
+            help="Subtract map-pack entries that appear above the organic list.",
+        )
+
+        page_count = st.selectbox(
+            "Pages to scan",
+            list(range(1, 11)),
+            index=DEFAULT_MAX_PAGES - 1,
+            help="How many Google result pages to inspect before stopping. Default is 5.",
+        )
+
+    keyword = st.text_input("Enter Keyword", placeholder="e.g., digital agency")
+    target_domain = st.text_input("Enter Target Domain", placeholder="e.g., limedigital.co.il")
+    match_mode = st.radio(
+        "Match Mode",
+        ["Domain (any page on domain)", "Exact URL (homepage/page only)"],
+        horizontal=True,
     )
+    normalized_target_domain = normalize_domain(target_domain)
 
-    location_options = get_city_options(country)
-    if geonamescache is None:
-        st.caption("Install geonamescache to enable full city list.")
-    selected_location = st.selectbox(
-        "Location (city)",
-        location_options,
-        index=0,
-        help="Choose a city to match browser results more closely.",
-    )
-    location = "" if selected_location == "No location" else selected_location
+    if st.button("Check Ranking", type="primary"):
+        if not keyword or not target_domain:
+            st.warning("Please fill in both the Keyword and Target Domain fields.")
+        elif not normalized_target_domain:
+            st.warning("Please enter a valid target domain or URL.")
+        else:
+            with st.spinner("Opening browser and fetching Google results…"):
+                try:
+                    data = scrape_google(
+                        keyword.strip(),
+                        country,
+                        language,
+                        location,
+                        google_domain,
+                        max_pages=page_count,
+                    )
+                except Exception as e:
+                    st.error(f"An error occurred: {e}")
+                    st.stop()
 
-    strict_homepage_mode = st.checkbox(
-        "Strict homepage mode",
-        value=False,
-        help="When enabled, only counts a match if the homepage/root URL (/) ranks. Inner pages are ignored.",
-    )
+            fetched_at_epoch = data.get("_fetched_at")
+            fetched_at_text = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fetched_at_epoch))
+                if isinstance(fetched_at_epoch, int) else "unknown"
+            )
+            search_url = data.get("_search_url", "")
+            organic_results = data.get("organic", [])
 
-    st.subheader("📍 Local Pack Exclusion")
-    use_manual_local_exclusion = st.checkbox("Set map/business count manually", value=False)
-    manual_local_count = st.number_input(
-        "Non-sponsored map/business results above organic",
-        min_value=0, max_value=20, value=0, step=1,
-        help="Subtract map-pack entries that appear above the organic list.",
-    )
-
-# ---------------------------------------------------------------------------
-# Main inputs
-# ---------------------------------------------------------------------------
-
-keyword = st.text_input("Enter Keyword", placeholder="e.g., digital agency")
-target_domain = st.text_input("Enter Target Domain", placeholder="e.g., limedigital.co.il")
-match_mode = st.radio(
-    "Match Mode",
-    ["Domain (any page on domain)", "Exact URL (homepage/page only)"],
-    horizontal=True,
-)
-normalized_target_domain = normalize_domain(target_domain)
-
-# ---------------------------------------------------------------------------
-# Rank check
-# ---------------------------------------------------------------------------
-
-if st.button("Check Ranking", type="primary"):
-    if not keyword or not target_domain:
-        st.warning("Please fill in both the Keyword and Target Domain fields.")
-    elif not normalized_target_domain:
-        st.warning("Please enter a valid target domain or URL.")
-    else:
-        with st.spinner("Opening browser and fetching Google results…"):
-            try:
-                data = scrape_google(keyword.strip(), country, language, location, google_domain)
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+            if not organic_results:
+                page_url_after = data.get("_page_url_after", "")
+                if "google.com/sorry" in page_url_after:
+                    st.error("🚫 Google blocked the request (CAPTCHA / datacenter IP detected).")
+                    st.warning(
+                        "Streamlit Cloud's IP is flagged as a bot by Google. "
+                        "To fix this, add a **residential proxy URL** to your app's Secrets:\n\n"
+                        "```\nPROXY_URL = \"http://user:pass@proxy-host:port\"\n```\n\n"
+                        "Any residential proxy service (e.g. Bright Data, Oxylabs, IPRoyal) works. "
+                        "Alternatively, run the app **locally** — your home IP won't be blocked."
+                    )
+                else:
+                    st.error("No organic results were scraped.")
+                    st.caption(f"Page title: {data.get('_page_title', '?')}")
+                    st.caption(f"Final URL: {page_url_after}")
+                    st.caption(f"Found any h3 elements: {data.get('_got_h3', False)}")
+                if search_url:
+                    st.caption(f"Search URL: {search_url}")
                 st.stop()
 
-        fetched_at_epoch = data.get("_fetched_at")
-        fetched_at_text = (
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fetched_at_epoch))
-            if isinstance(fetched_at_epoch, int) else "unknown"
-        )
-        search_url = data.get("_search_url", "")
-        organic_results = data.get("organic", [])
-
-        if not organic_results:
-            page_url_after = data.get("_page_url_after", "")
-            if "google.com/sorry" in page_url_after:
-                st.error("🚫 Google blocked the request (CAPTCHA / datacenter IP detected).")
-                st.warning(
-                    "Streamlit Cloud's IP is flagged as a bot by Google. "
-                    "To fix this, add a **residential proxy URL** to your app's Secrets:\n\n"
-                    "```\nPROXY_URL = \"http://user:pass@proxy-host:port\"\n```\n\n"
-                    "Any residential proxy service (e.g. Bright Data, Oxylabs, IPRoyal) works. "
-                    "Alternatively, run the app **locally** — your home IP won't be blocked."
-                )
-            else:
-                st.error("No organic results were scraped.")
-                st.caption(f"Page title: {data.get('_page_title', '?')}")
-                st.caption(f"Final URL: {page_url_after}")
-                st.caption(f"Found any h3 elements: {data.get('_got_h3', False)}")
+            st.caption(f"Scraped {len(organic_results)} organic results — {fetched_at_text}")
             if search_url:
                 st.caption(f"Search URL: {search_url}")
-            st.stop()
 
-        st.caption(f"Scraped {len(organic_results)} organic results — {fetched_at_text}")
-        if search_url:
-            st.caption(f"Search URL: {search_url}")
+            local_business_count = int(manual_local_count) if use_manual_local_exclusion else 0
 
-        local_business_count = int(manual_local_count) if use_manual_local_exclusion else 0
+            found = False
+            visual_rank = 0
+            first_domain_match = None
+            first_domain_match_rank = None
+            first_domain_match_api_pos = None
+            homepage_domain_match = None
+            homepage_domain_match_rank = None
+            homepage_domain_match_api_pos = None
+            same_domain_result = None
+            selected = None
+            selected_rank = None
+            selected_api_pos = None
 
-        found = False
-        visual_rank = 0
-        first_domain_match = None
-        first_domain_match_rank = None
-        first_domain_match_api_pos = None
-        homepage_domain_match = None
-        homepage_domain_match_rank = None
-        homepage_domain_match_api_pos = None
-        same_domain_result = None
-        selected = None
-        selected_rank = None
-        selected_api_pos = None
+            for result in organic_results:
+                result_url = result.get("link", "")
+                clean_domain = normalize_domain(result_url)
+                if not clean_domain:
+                    continue
 
-        for result in organic_results:
-            result_url = result.get("link", "")
-            clean_domain = normalize_domain(result_url)
-            if not clean_domain:
-                continue
+                api_position = result.get("position", visual_rank + 1)
 
-            api_position = result.get("position", visual_rank + 1)
+                if is_google_map_or_utility(result_url, clean_domain):
+                    continue
 
-            if is_google_map_or_utility(result_url, clean_domain):
-                continue
+                visual_rank += 1
 
-            visual_rank += 1
+                is_match = domains_match(normalized_target_domain, clean_domain)
+                if same_domain_result is None and is_match:
+                    same_domain_result = result
 
-            is_match = domains_match(normalized_target_domain, clean_domain)
-            if same_domain_result is None and is_match:
-                same_domain_result = result
+                if match_mode == "Domain (any page on domain)" and is_match:
+                    if first_domain_match is None:
+                        first_domain_match = result
+                        first_domain_match_rank = visual_rank
+                        first_domain_match_api_pos = api_position
+                    if homepage_domain_match is None and is_homepage_url(result_url):
+                        homepage_domain_match = result
+                        homepage_domain_match_rank = visual_rank
+                        homepage_domain_match_api_pos = api_position
+                    continue
 
-            if match_mode == "Domain (any page on domain)" and is_match:
-                if first_domain_match is None:
-                    first_domain_match = result
-                    first_domain_match_rank = visual_rank
-                    first_domain_match_api_pos = api_position
-                if homepage_domain_match is None and is_homepage_url(result_url):
-                    homepage_domain_match = result
-                    homepage_domain_match_rank = visual_rank
-                    homepage_domain_match_api_pos = api_position
-                continue
+                if match_mode == "Exact URL (homepage/page only)":
+                    is_match = exact_url_match(target_domain, result_url)
 
-            if match_mode == "Exact URL (homepage/page only)":
-                is_match = exact_url_match(target_domain, result_url)
+                if is_match:
+                    raw_organic_rank = api_position
+                    adjusted_rank = max(1, raw_organic_rank - local_business_count)
+                    organic_page_number = ((adjusted_rank - 1) // 10) + 1
+                    organic_page_position = ((adjusted_rank - 1) % 10) + 1
+                    matched_url = result.get("link", "")
+                    matched_is_homepage = is_homepage_url(matched_url)
 
-            if is_match:
-                raw_organic_rank = api_position
-                adjusted_rank = max(1, raw_organic_rank - local_business_count)
+                    st.balloons()
+                    st.success(f"🎯 **Match Found at Adjusted Organic Position {adjusted_rank}!**")
+                    st.caption(f"Raw organic position: {raw_organic_rank}")
+                    st.caption(f"Page {organic_page_number}, place {organic_page_position} on that page")
+                    if use_manual_local_exclusion:
+                        st.caption(f"Local businesses subtracted (manual): {local_business_count}")
+                    st.caption(
+                        "Matched URL type: "
+                        f"{'homepage/root' if matched_is_homepage else 'inner page'}"
+                    )
+                    st.caption(
+                        f"Context: gl={country}, hl={language}, domain={google_domain}, "
+                        f"location={location.strip() or 'not set'}"
+                    )
+                    st.info(
+                        f"**Title:** {result.get('title')}\n\n"
+                        f"**URL:** [{result.get('link')}]({result.get('link')})"
+                    )
+                    found = True
+                    break
+
+            if not found and match_mode == "Domain (any page on domain)" and first_domain_match is not None:
+                if strict_homepage_mode and homepage_domain_match is None:
+                    selected = selected_rank = selected_api_pos = None
+                else:
+                    selected = homepage_domain_match or first_domain_match
+                    selected_rank = homepage_domain_match_rank or first_domain_match_rank
+                    selected_api_pos = homepage_domain_match_api_pos or first_domain_match_api_pos
+
+            if not found and match_mode == "Domain (any page on domain)" and selected is not None:
+                adjusted_rank = max(1, selected_api_pos - local_business_count)
                 organic_page_number = ((adjusted_rank - 1) // 10) + 1
                 organic_page_position = ((adjusted_rank - 1) % 10) + 1
-                matched_url = result.get("link", "")
-                matched_is_homepage = is_homepage_url(matched_url)
 
                 st.balloons()
                 st.success(f"🎯 **Match Found at Adjusted Organic Position {adjusted_rank}!**")
-                st.caption(f"Raw organic position: {raw_organic_rank}")
+                st.caption(f"Raw organic position: {selected_api_pos}")
                 st.caption(f"Page {organic_page_number}, place {organic_page_position} on that page")
                 if use_manual_local_exclusion:
                     st.caption(f"Local businesses subtracted (manual): {local_business_count}")
-                st.caption(
-                    "Matched URL type: "
-                    f"{'homepage/root' if matched_is_homepage else 'inner page'}"
-                )
                 st.caption(
                     f"Context: gl={country}, hl={language}, domain={google_domain}, "
                     f"location={location.strip() or 'not set'}"
                 )
                 st.info(
-                    f"**Title:** {result.get('title')}\n\n"
-                    f"**URL:** [{result.get('link')}]({result.get('link')})"
+                    f"**Title:** {selected.get('title')}\n\n"
+                    f"**URL:** [{selected.get('link')}]({selected.get('link')})"
                 )
+                if homepage_domain_match is None:
+                    st.caption("Homepage URL not found; showing first matching page on the domain.")
+                else:
+                    st.caption("Homepage URL found and preferred.")
                 found = True
-                break
 
-        # Domain-mode fallback: prefer homepage, else first domain match.
-        if not found and match_mode == "Domain (any page on domain)" and first_domain_match is not None:
-            if strict_homepage_mode and homepage_domain_match is None:
-                selected = selected_rank = selected_api_pos = None
-            else:
-                selected = homepage_domain_match or first_domain_match
-                selected_rank = homepage_domain_match_rank or first_domain_match_rank
-                selected_api_pos = homepage_domain_match_api_pos or first_domain_match_api_pos
+            if not found:
+                if strict_homepage_mode and same_domain_result is not None:
+                    st.warning(f"Homepage '{target_domain}' not found in organic results for '{keyword}'.")
+                    st.info(
+                        f"Domain was found but not the homepage. "
+                        f"Closest match: {same_domain_result.get('link')} "
+                        f"(position {same_domain_result.get('position')})."
+                    )
+                elif match_mode == "Exact URL (homepage/page only)" and same_domain_result is not None:
+                    st.warning(f"Exact URL '{target_domain}' not found in organic results for '{keyword}'.")
+                    st.info(
+                        f"Domain was found but not the exact URL. "
+                        f"Closest match: {same_domain_result.get('link')} "
+                        f"(position {same_domain_result.get('position')})."
+                    )
+                else:
+                    st.error(f"❌ '{target_domain}' was not found in the organic results for '{keyword}'.")
 
-        if not found and match_mode == "Domain (any page on domain)" and selected is not None:
-            adjusted_rank = max(1, selected_api_pos - local_business_count)
-            organic_page_number = ((adjusted_rank - 1) // 10) + 1
-            organic_page_position = ((adjusted_rank - 1) % 10) + 1
 
-            st.balloons()
-            st.success(f"🎯 **Match Found at Adjusted Organic Position {adjusted_rank}!**")
-            st.caption(f"Raw organic position: {selected_api_pos}")
-            st.caption(f"Page {organic_page_number}, place {organic_page_position} on that page")
-            if use_manual_local_exclusion:
-                st.caption(f"Local businesses subtracted (manual): {local_business_count}")
-            st.caption(
-                f"Context: gl={country}, hl={language}, domain={google_domain}, "
-                f"location={location.strip() or 'not set'}"
-            )
-            st.info(
-                f"**Title:** {selected.get('title')}\n\n"
-                f"**URL:** [{selected.get('link')}]({selected.get('link')})"
-            )
-            if homepage_domain_match is None:
-                st.caption("Homepage URL not found; showing first matching page on the domain.")
-            else:
-                st.caption("Homepage URL found and preferred.")
-            found = True
-
-        if not found:
-            if strict_homepage_mode and same_domain_result is not None:
-                st.warning(f"Homepage '{target_domain}' not found in organic results for '{keyword}'.")
-                st.info(
-                    f"Domain was found but not the homepage. "
-                    f"Closest match: {same_domain_result.get('link')} "
-                    f"(position {same_domain_result.get('position')})."
-                )
-            elif match_mode == "Exact URL (homepage/page only)" and same_domain_result is not None:
-                st.warning(f"Exact URL '{target_domain}' not found in organic results for '{keyword}'.")
-                st.info(
-                    f"Domain was found but not the exact URL. "
-                    f"Closest match: {same_domain_result.get('link')} "
-                    f"(position {same_domain_result.get('position')})."
-                )
-            else:
-                st.error(f"❌ '{target_domain}' was not found in the organic results for '{keyword}'.")
+if __name__ == "__main__":
+    main()
