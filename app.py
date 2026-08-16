@@ -1,8 +1,10 @@
 import streamlit as st
 from urllib.parse import urlparse, urlencode
 import base64
+import os
 import subprocess
 import sys
+import tempfile
 import time
 
 DEFAULT_MAX_PAGES = 5
@@ -246,10 +248,20 @@ def _get_proxy() -> dict | None:
     return None
 
 
-import os
+
+
+def browser_profile_dir() -> str:
+    """Return the stable user profile directory for Chrome, falling back to a fresh temp profile if needed."""
+    home_dir = os.path.abspath(os.path.expanduser("~"))
+    return os.path.abspath(os.path.join(home_dir, ".browser_rank_profile"))
+
+
+def browser_profile_dir_fallback() -> str:
+    return os.path.abspath(os.path.join(tempfile.gettempdir(), f"browser_rank_profile_{os.getpid()}"))
+
 
 # Persist cookies/profile between searches so a solved CAPTCHA stays valid.
-_PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".browser_rank_profile")
+_PROFILE_DIR = browser_profile_dir()
 
 _CONTEXT_KWARGS = lambda hl, gl: dict(
     viewport={"width": 1280, "height": 900},
@@ -307,15 +319,26 @@ def scrape_google(
             )
             context = browser.new_context(**_CONTEXT_KWARGS(hl, gl))
         else:
+            profile_dir = _PROFILE_DIR
+            context = None
             try:
                 context = p.chromium.launch_persistent_context(
-                    _PROFILE_DIR, headless=False, channel="chrome", **_CONTEXT_KWARGS(hl, gl)
+                    profile_dir, headless=False, channel="chrome", **_CONTEXT_KWARGS(hl, gl)
                 )
             except Exception:
-                context = p.chromium.launch_persistent_context(
-                    _PROFILE_DIR, headless=False,
-                    args=["--no-sandbox"], **_CONTEXT_KWARGS(hl, gl)
-                )
+                try:
+                    os.makedirs(profile_dir, exist_ok=True)
+                    context = p.chromium.launch_persistent_context(
+                        browser_profile_dir_fallback(), headless=False, channel="chrome",
+                        args=["--no-sandbox"], **_CONTEXT_KWARGS(hl, gl)
+                    )
+                except Exception:
+                    context = p.chromium.launch(
+                        headless=False,
+                        channel="chrome",
+                        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                    )
+                    context = context.new_context(**_CONTEXT_KWARGS(hl, gl))
 
         page = context.new_page()
 
