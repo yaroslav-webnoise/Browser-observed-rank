@@ -128,6 +128,46 @@ def build_google_page_url(
     return f"https://www.{google_domain}/search?{urlencode(params)}"
 
 
+def is_google_captcha_page(url: str | None) -> bool:
+    if not url:
+        return False
+    lowered = url.lower()
+    return "google.com/sorry" in lowered or "/sorry/index" in lowered
+
+
+def _wait_for_captcha_resolution(page, timeout_seconds: int = 600) -> bool:
+    """Wait while the user manually solves a Google CAPTCHA in the visible Chrome window."""
+    deadline = time.monotonic() + timeout_seconds
+    last_message = None
+    while time.monotonic() < deadline:
+        current_url = page.url
+        if not is_google_captcha_page(current_url):
+            return True
+        if last_message != current_url:
+            last_message = current_url
+            st.warning(
+                "Google is showing a CAPTCHA. Please solve it in the Chrome window, then the app will continue automatically."
+            )
+        time.sleep(2)
+    return False
+
+
+def _page_contains_target_match(page_results: list[dict] | None, target_domain: str, match_mode: str) -> bool:
+    if not page_results or not target_domain:
+        return False
+
+    normalized_target = normalize_domain(target_domain)
+    for result in page_results:
+        link = result.get("link", "") or ""
+        if match_mode == "Domain (any page on domain)":
+            if domains_match(normalized_target, normalize_domain(link)):
+                return True
+        elif match_mode == "Exact URL (homepage/page only)":
+            if exact_url_match(target_domain, link):
+                return True
+    return False
+
+
 def should_continue_scraping(
     page_results: list[dict] | None,
     page_num: int,
@@ -247,7 +287,14 @@ def _extract_page_results(page) -> list[dict]:
 
 
 def scrape_google(
-    query: str, gl: str, hl: str, location: str, google_domain: str, max_pages: int = DEFAULT_MAX_PAGES
+    query: str,
+    gl: str,
+    hl: str,
+    location: str,
+    google_domain: str,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    target_domain: str | None = None,
+    match_mode: str | None = None,
 ) -> dict:
     proxy = _get_proxy()
     first_url = build_google_page_url(query, gl, hl, location, google_domain, start=0)
@@ -283,13 +330,15 @@ def scrape_google(
         page_url_after = page.url
         page_title = page.title()
 
-        if "google.com/sorry" in page_url_after:
-            context.close()
-            return {
-                "organic": [], "_fetched_at": int(time.time()),
-                "_search_url": first_url, "_page_title": page_title,
-                "_page_url_after": page_url_after, "_got_h3": False,
-            }
+        if is_google_captcha_page(page_url_after):
+            st.warning(
+                "Google is showing a CAPTCHA. Please solve it in the Chrome window, then the app will continue automatically."
+            )
+            if not _wait_for_captcha_resolution(page, timeout_seconds=600):
+                context.close()
+                raise RuntimeError("Google CAPTCHA was not solved in time. Please retry after completing the verification.")
+            page_url_after = page.url
+            page_title = page.title()
 
         all_raw: list[dict] = []
         for page_num in range(max_pages):
@@ -306,6 +355,8 @@ def scrape_google(
             if not page_raw:
                 break
             all_raw.extend(page_raw)
+            if target_domain and match_mode and _page_contains_target_match(page_raw, target_domain, match_mode):
+                break
             if not should_continue_scraping(page_raw, page_num, max_pages):
                 break
 
@@ -489,6 +540,8 @@ def main() -> None:
                         location,
                         google_domain,
                         max_pages=page_count,
+                        target_domain=target_domain,
+                        match_mode=match_mode,
                     )
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
