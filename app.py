@@ -2,6 +2,7 @@ import streamlit as st
 from urllib.parse import urlparse, urlencode
 import base64
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -260,6 +261,60 @@ def browser_profile_dir_fallback() -> str:
     return os.path.abspath(os.path.join(tempfile.gettempdir(), f"browser_rank_profile_{os.getpid()}"))
 
 
+def _launch_persistent_context_with_fallback(p, profile_dir: str, **kwargs):
+    """Rotate stale persistent Chrome profiles before falling back to a fresh ephemeral context."""
+    try:
+        return p.chromium.launch_persistent_context(profile_dir, **kwargs)
+    except Exception:
+        stale_backup = f"{profile_dir}.stale-{int(time.time())}"
+        if os.path.exists(profile_dir):
+            try:
+                os.rename(profile_dir, stale_backup)
+            except Exception:
+                try:
+                    shutil.rmtree(profile_dir)
+                except Exception:
+                    pass
+        fresh_dir = browser_profile_dir_fallback()
+        try:
+            return p.chromium.launch_persistent_context(fresh_dir, **kwargs)
+        except Exception:
+            if os.path.exists(fresh_dir):
+                try:
+                    shutil.rmtree(fresh_dir)
+                except Exception:
+                    pass
+            raise
+
+
+def _create_browser_context(p, *, use_proxy: bool, gl: str, hl: str):
+    """Create a browser context with a persistent profile when possible, else a fresh context."""
+    if use_proxy:
+        browser = p.chromium.launch(
+            headless=True,
+            proxy={"server": st.secrets.get("PROXY_URL", "")},
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
+
+    try:
+        context = _launch_persistent_context_with_fallback(
+            p,
+            _PROFILE_DIR,
+            headless=False,
+            channel="chrome",
+            **_CONTEXT_KWARGS(hl, gl),
+        )
+        return context, None
+    except Exception:
+        browser = p.chromium.launch(
+            headless=False,
+            channel="chrome",
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        return browser.new_context(**_CONTEXT_KWARGS(hl, gl)), browser
+
+
 # Persist cookies/profile between searches so a solved CAPTCHA stays valid.
 _PROFILE_DIR = browser_profile_dir()
 
@@ -312,6 +367,7 @@ def scrape_google(
     first_url = build_google_page_url(query, gl, hl, location, google_domain, start=0)
 
     with sync_playwright() as p:
+        proxy = proxy or _get_proxy()
         if proxy:
             browser = p.chromium.launch(
                 headless=True, proxy=proxy,
@@ -319,26 +375,7 @@ def scrape_google(
             )
             context = browser.new_context(**_CONTEXT_KWARGS(hl, gl))
         else:
-            profile_dir = _PROFILE_DIR
-            context = None
-            try:
-                context = p.chromium.launch_persistent_context(
-                    profile_dir, headless=False, channel="chrome", **_CONTEXT_KWARGS(hl, gl)
-                )
-            except Exception:
-                try:
-                    os.makedirs(profile_dir, exist_ok=True)
-                    context = p.chromium.launch_persistent_context(
-                        browser_profile_dir_fallback(), headless=False, channel="chrome",
-                        args=["--no-sandbox"], **_CONTEXT_KWARGS(hl, gl)
-                    )
-                except Exception:
-                    context = p.chromium.launch(
-                        headless=False,
-                        channel="chrome",
-                        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-                    )
-                    context = context.new_context(**_CONTEXT_KWARGS(hl, gl))
+            context, browser = _create_browser_context(p, use_proxy=False, gl=gl, hl=hl)
 
         page = context.new_page()
 
@@ -386,6 +423,11 @@ def scrape_google(
         fetched_at = int(time.time())
         page.close()
         context.close()
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     organic = [
         {"position": i + 1, "link": r["link"], "title": r["title"], "snippet": r["snippet"]}
