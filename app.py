@@ -122,119 +122,208 @@ def build_google_url(query: str, gl: str, hl: str, location: str, google_domain:
     return f"https://www.{google_domain}/search?{urlencode(params)}"
 
 
+
+def build_google_page_url(
+    query: str, gl: str, hl: str, location: str, google_domain: str, start: int = 0
+) -> str:
+    params = {
+        "q": query,
+        "gl": gl,
+        "hl": hl,
+        "pws": "0",
+        "nfpr": "1",
+        "filter": "0",
+    }
+    if start:
+        params["start"] = str(start)
+    if location:
+        uule = encode_uule(location)
+        if uule:
+            params["uule"] = uule
+    return f"https://www.{google_domain}/search?{urlencode(params)}"
+
+
+_EXTRACT_JS = """() => {
+    const results = [];
+    const seen = new Set();
+    const container = document.querySelector('#rso') || document.querySelector('#search') || document.body;
+    container.querySelectorAll('a[href]').forEach(a => {
+        const href = a.href;
+        if (!href || !href.startsWith('http') || seen.has(href)) return;
+
+        // Skip Google-internal and ad redirect URLs.
+        if (href.includes('/aclk?') || href.includes('googleadservices.com') ||
+            href.includes('googlesyndication.com')) return;
+        try {
+            const u = new URL(href);
+            if (u.hostname.includes('google.') || u.hostname.endsWith('goo.gl') ||
+                u.hostname.endsWith('g.page')) return;
+        } catch(e) { return; }
+
+        // Skip links inside known ad or non-organic containers.
+        if (a.closest('[data-text-ad]') || a.closest('.ads-ad') ||
+            a.closest('[aria-label="Ads"]') || a.closest('.commercial-unit-desktop-top')) return;
+
+        // Skip "People also ask" and similar expandable boxes.
+        if (a.closest('[data-q]') || a.closest('.related-question-pair') ||
+            a.closest('[jsname="yEVEwb"]')) return;
+
+        // Must have an associated h3 heading — the hallmark of an organic result.
+        const h3 = a.querySelector('h3')
+            || a.closest('[data-hveid], .g, [jscontroller]')?.querySelector('h3');
+        if (!h3) return;
+
+        seen.add(href);
+        const parent = a.closest('[data-hveid]') || a.closest('.g') || a.parentElement;
+        const snippetEl = parent
+            ? (parent.querySelector('[data-sncf="1"]') ||
+               parent.querySelector('.VwiC3b') ||
+               parent.querySelector('[style*="-webkit-line-clamp"]'))
+            : null;
+        results.push({
+            link: href,
+            title: h3.innerText.trim(),
+            snippet: snippetEl ? snippetEl.innerText.trim() : '',
+        });
+    });
+    return results;
+}"""
+
+
 # ---------------------------------------------------------------------------
 # Google scraper
 # ---------------------------------------------------------------------------
 
-def scrape_google(query: str, gl: str, hl: str, location: str, google_domain: str) -> dict:
-    url = build_google_url(query, gl, hl, location, google_domain)
+def _get_proxy() -> dict | None:
+    """Read proxy URL from Streamlit secrets, e.g. PROXY_URL = 'http://user:pass@host:port'."""
+    try:
+        raw = st.secrets.get("PROXY_URL", "")
+        if raw:
+            return {"server": raw}
+    except Exception:
+        pass
+    return None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-            locale=f"{hl}-{gl.upper()}",
-            extra_http_headers={
-                "Accept-Language": f"{hl}-{gl.upper()},{hl};q=0.9,en;q=0.8",
-            },
-        )
-        page = context.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
 
+import os
+
+# Persist cookies/profile between searches so a solved CAPTCHA stays valid.
+_PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".browser_rank_profile")
+
+_CONTEXT_KWARGS = lambda hl, gl: dict(
+    viewport={"width": 1280, "height": 900},
+    locale=f"{hl}-{gl.upper()}",
+    extra_http_headers={"Accept-Language": f"{hl}-{gl.upper()},{hl};q=0.9,en;q=0.8"},
+)
+
+_CONSENT_SELECTORS = [
+    "button#L2AGLb", "button#W0wltc", "button[jsname='higCR']",
+    "button[jsname='b3VHJd']", "button[jsname='tWT92d']",
+    "form[action*='consent'] button", "div[role='none'] button",
+]
+
+
+def _dismiss_consent(page) -> None:
+    for sel in _CONSENT_SELECTORS:
         try:
-            page.goto(url, wait_until="load", timeout=30_000)
-        except Exception as e:
-            browser.close()
-            raise RuntimeError(f"Failed to load Google: {e}") from e
-
-        # Consent dialogs vary by region; try every known selector.
-        consent_selectors = [
-            "button#L2AGLb",
-            "button#W0wltc",
-            "button[jsname='higCR']",
-            "button[jsname='b3VHJd']",
-            "button[jsname='tWT92d']",
-            "form[action*='consent'] button",
-            "div[role='none'] button",
-        ]
-        for sel in consent_selectors:
-            try:
-                btn = page.query_selector(sel)
-                if btn and btn.is_visible():
-                    btn.click()
-                    page.wait_for_load_state("load", timeout=8_000)
-                    break
-            except Exception:
-                pass
-
-        # Wait for result headings; capture page state for debugging if they never appear.
-        got_results = False
-        try:
-            page.wait_for_selector("h3", timeout=12_000)
-            got_results = True
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                page.wait_for_load_state("load", timeout=8_000)
+                return
         except Exception:
             pass
 
-        page_title = page.title()
-        page_url_after = page.url
 
-        # Extract organic results via JS — looks for <a><h3> pairs inside #rso.
-        raw_results: list[dict] = page.evaluate(
-            """() => {
-                const results = [];
-                const seen = new Set();
-                const container = document.querySelector('#rso') || document.querySelector('#search') || document.body;
-                container.querySelectorAll('h3').forEach(h3 => {
-                    const a = h3.closest('a[href]') || h3.querySelector('a[href]');
-                    if (!a) return;
-                    const href = a.href;
-                    if (!href || !href.startsWith('http') || seen.has(href)) return;
-                    try {
-                        const u = new URL(href);
-                        if (u.pathname === '/search' || u.pathname.startsWith('/maps')) return;
-                        if (u.hostname.includes('google.') && !u.hostname.startsWith('www.')) return;
-                    } catch(e) { return; }
-                    seen.add(href);
-                    const parent = a.closest('[data-hveid]') || a.closest('.g') || a.parentElement;
-                    const snippetEl = parent
-                        ? (parent.querySelector('[data-sncf="1"]') ||
-                           parent.querySelector('.VwiC3b') ||
-                           parent.querySelector('[style*="-webkit-line-clamp"]'))
-                        : null;
-                    results.push({
-                        link: href,
-                        title: h3.innerText.trim(),
-                        snippet: snippetEl ? snippetEl.innerText.trim() : '',
-                    });
-                });
-                return results;
-            }"""
-        )
+def _extract_page_results(page) -> list[dict]:
+    try:
+        page.wait_for_selector("h3", timeout=10_000)
+    except Exception:
+        return []
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(1000)
+    return page.evaluate(_EXTRACT_JS)
+
+
+def scrape_google(
+    query: str, gl: str, hl: str, location: str, google_domain: str, max_pages: int = 10
+) -> dict:
+    proxy = _get_proxy()
+    first_url = build_google_page_url(query, gl, hl, location, google_domain, start=0)
+
+    with sync_playwright() as p:
+        if proxy:
+            browser = p.chromium.launch(
+                headless=True, proxy=proxy,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(**_CONTEXT_KWARGS(hl, gl))
+        else:
+            try:
+                context = p.chromium.launch_persistent_context(
+                    _PROFILE_DIR, headless=False, channel="chrome", **_CONTEXT_KWARGS(hl, gl)
+                )
+            except Exception:
+                context = p.chromium.launch_persistent_context(
+                    _PROFILE_DIR, headless=False,
+                    args=["--no-sandbox"], **_CONTEXT_KWARGS(hl, gl)
+                )
+
+        page = context.new_page()
+
+        try:
+            page.goto(first_url, wait_until="load", timeout=30_000)
+        except Exception as e:
+            context.close()
+            raise RuntimeError(f"Failed to load Google: {e}") from e
+
+        _dismiss_consent(page)
+
+        page_url_after = page.url
+        page_title = page.title()
+
+        if "google.com/sorry" in page_url_after:
+            context.close()
+            return {
+                "organic": [], "_fetched_at": int(time.time()),
+                "_search_url": first_url, "_page_title": page_title,
+                "_page_url_after": page_url_after, "_got_h3": False,
+            }
+
+        all_raw: list[dict] = []
+        for page_num in range(max_pages):
+            if page_num > 0:
+                next_url = build_google_page_url(
+                    query, gl, hl, location, google_domain, start=page_num * 10
+                )
+                try:
+                    page.goto(next_url, wait_until="load", timeout=20_000)
+                except Exception:
+                    break
+
+            page_raw = _extract_page_results(page)
+            if not page_raw:
+                break
+            all_raw.extend(page_raw)
+            # Stop early if Google returned a short page (end of results).
+            if len(page_raw) < 7:
+                break
 
         fetched_at = int(time.time())
-        browser.close()
+        page.close()
+        context.close()
 
     organic = [
         {"position": i + 1, "link": r["link"], "title": r["title"], "snippet": r["snippet"]}
-        for i, r in enumerate(raw_results)
+        for i, r in enumerate(all_raw)
     ]
     return {
         "organic": organic,
         "_fetched_at": fetched_at,
-        "_search_url": url,
+        "_search_url": first_url,
         "_page_title": page_title,
         "_page_url_after": page_url_after,
-        "_got_h3": got_results,
+        "_got_h3": bool(all_raw),
     }
 
 
@@ -342,8 +431,8 @@ with st.sidebar:
 
     strict_homepage_mode = st.checkbox(
         "Strict homepage mode",
-        value=True,
-        help="Only report the root URL (/). Won't fall back to inner pages.",
+        value=False,
+        help="When enabled, only counts a match if the homepage/root URL (/) ranks. Inner pages are ignored.",
     )
 
     st.subheader("📍 Local Pack Exclusion")
@@ -393,10 +482,21 @@ if st.button("Check Ranking", type="primary"):
         organic_results = data.get("organic", [])
 
         if not organic_results:
-            st.error("No organic results were scraped.")
-            st.caption(f"Page title: {data.get('_page_title', '?')}")
-            st.caption(f"Final URL: {data.get('_page_url_after', '?')}")
-            st.caption(f"Found any h3 elements: {data.get('_got_h3', False)}")
+            page_url_after = data.get("_page_url_after", "")
+            if "google.com/sorry" in page_url_after:
+                st.error("🚫 Google blocked the request (CAPTCHA / datacenter IP detected).")
+                st.warning(
+                    "Streamlit Cloud's IP is flagged as a bot by Google. "
+                    "To fix this, add a **residential proxy URL** to your app's Secrets:\n\n"
+                    "```\nPROXY_URL = \"http://user:pass@proxy-host:port\"\n```\n\n"
+                    "Any residential proxy service (e.g. Bright Data, Oxylabs, IPRoyal) works. "
+                    "Alternatively, run the app **locally** — your home IP won't be blocked."
+                )
+            else:
+                st.error("No organic results were scraped.")
+                st.caption(f"Page title: {data.get('_page_title', '?')}")
+                st.caption(f"Final URL: {page_url_after}")
+                st.caption(f"Found any h3 elements: {data.get('_got_h3', False)}")
             if search_url:
                 st.caption(f"Search URL: {search_url}")
             st.stop()
@@ -454,8 +554,8 @@ if st.button("Check Ranking", type="primary"):
             if is_match:
                 raw_organic_rank = api_position
                 adjusted_rank = max(1, raw_organic_rank - local_business_count)
-                organic_page_number = ((raw_organic_rank - 1) // 10) + 1
-                organic_page_position = ((raw_organic_rank - 1) % 10) + 1
+                organic_page_number = ((adjusted_rank - 1) // 10) + 1
+                organic_page_position = ((adjusted_rank - 1) % 10) + 1
                 matched_url = result.get("link", "")
                 matched_is_homepage = is_homepage_url(matched_url)
 
@@ -491,8 +591,8 @@ if st.button("Check Ranking", type="primary"):
 
         if not found and match_mode == "Domain (any page on domain)" and selected is not None:
             adjusted_rank = max(1, selected_api_pos - local_business_count)
-            organic_page_number = ((selected_api_pos - 1) // 10) + 1
-            organic_page_position = ((selected_api_pos - 1) % 10) + 1
+            organic_page_number = ((adjusted_rank - 1) // 10) + 1
+            organic_page_position = ((adjusted_rank - 1) % 10) + 1
 
             st.balloons()
             st.success(f"🎯 **Match Found at Adjusted Organic Position {adjusted_rank}!**")
